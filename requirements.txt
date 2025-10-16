@@ -2,7 +2,8 @@ streamlit
 transformers
 torch
 gTTS
-moviepy
+moviepy==1.0.3
 Pillow
 requests
+
 
