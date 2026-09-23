@@ -1,8 +1,8 @@
 streamlit
-synctoon
 Pillow
 opencv-python-headless
 numpy
 pandas
 elevenlabs
+google-generativeai
 anthropic
