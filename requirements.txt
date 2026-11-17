@@ -9,3 +9,4 @@ anthropic
 nPyMuPDF
 npandas
 nopenpyxl
+fitz
