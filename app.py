@@ -3,7 +3,7 @@ import re
 import io
 from datetime import datetime
 
-import fitz  # PyMuPDF
+import fitz
 import pandas as pd
 import streamlit as st
 
@@ -12,34 +12,20 @@ from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
 
 
-# ============================================================
-# PAGE CONFIGURATION
-# ============================================================
+# ==========================================================
+# CONFIG
+# ==========================================================
 
 st.set_page_config(
-    page_title="Biogene India - Bill of Entry Extractor",
+    page_title="Biogene India - BOE Extractor",
     page_icon="📄",
     layout="wide"
 )
 
 st.title("📄 Biogene India - Bill of Entry Extractor")
-st.caption(
-    "Bill of Entry PDF → BOE Details → Item Details → "
-    "HSN-wise GST Summary → Excel"
-)
+st.caption("First Page GST Summary + Item-wise Extraction + Reconciliation")
 
-st.info(
-    "Upload your ICEGATE Bill of Entry PDF. "
-    "The system extracts item details and prepares an Excel report "
-    "with validation checks."
-)
-
-
-# ============================================================
-# CONSTANTS
-# ============================================================
-
-NUMBER_PATTERN = r"-?\d[\d,]*(?:\.\d+)?"
+NUMBER = r"-?\d[\d,]*(?:\.\d+)?"
 
 ITEM_START = re.compile(
     r"^\s*(\d+)\s+(\d+)\s+(\d{8})\s+NOEXCISE\b(.*)$",
@@ -47,45 +33,49 @@ ITEM_START = re.compile(
 )
 
 
-# ============================================================
-# BASIC HELPERS
-# ============================================================
+# ==========================================================
+# HELPERS
+# ==========================================================
 
-def clean_text(value):
-    value = str(value or "")
-    value = value.replace("\xa0", " ")
-    value = value.replace("\u200b", "")
-    value = re.sub(r"[ \t]+", " ", value)
-    return value.strip()
+def clean(value):
+    return re.sub(
+        r"\s+",
+        " ",
+        str(value or "").replace("\xa0", " ")
+    ).strip()
 
 
-def to_number(value):
+def num(value):
     if value is None:
         return None
-
     try:
         return float(str(value).replace(",", "").strip())
     except (ValueError, TypeError):
         return None
 
 
-def get_numbers(text):
-    return re.findall(NUMBER_PATTERN, text or "")
+def numbers(text):
+    return re.findall(NUMBER, text or "")
 
 
-def safe_sum(series):
-    return round(pd.to_numeric(series, errors="coerce").sum(), 2)
-
-
-def indian_number_format(value):
+def money(value):
+    if value is None:
+        return ""
     return f"{value:,.2f}"
 
 
-# ============================================================
-# PDF TEXT EXTRACTION
-# ============================================================
+def safe_sum(series):
+    return round(
+        pd.to_numeric(series, errors="coerce").sum(),
+        2
+    )
 
-def extract_pdf_text(pdf_bytes):
+
+# ==========================================================
+# PDF READER
+# ==========================================================
+
+def read_pdf(pdf_bytes):
 
     try:
         doc = fitz.open(
@@ -93,104 +83,122 @@ def extract_pdf_text(pdf_bytes):
             filetype="pdf"
         )
 
-        page_texts = []
+        pages = []
 
         for page in doc:
-            text = page.get_text("text", sort=True) or ""
-            page_texts.append(text)
+            pages.append(
+                page.get_text("text", sort=True) or ""
+            )
 
         doc.close()
 
-        return page_texts
+        return pages
 
-    except Exception as exc:
-        raise RuntimeError(
-            f"PDF read nahi ho paayi: {exc}"
+    except Exception as e:
+        raise RuntimeError(f"PDF reading error: {e}")
+
+
+# ==========================================================
+# POSITION-AWARE TEXT LINES
+# ==========================================================
+
+def get_position_lines(page):
+
+    words = page.get_text("words", sort=True)
+
+    grouped = {}
+
+    for word in words:
+
+        x0, y0, x1, y1, text = word[:5]
+
+        key = round(y0, 1)
+
+        grouped.setdefault(key, []).append(
+            (x0, clean(text))
         )
 
+    result = []
 
-# ============================================================
+    for y in sorted(grouped):
+
+        row = sorted(
+            grouped[y],
+            key=lambda x: x[0]
+        )
+
+        result.append(
+            (y, " ".join(item[1] for item in row))
+        )
+
+    return result
+
+
+# ==========================================================
 # HEADER EXTRACTION
-# ============================================================
+# ==========================================================
 
-def extract_header(page_texts, pdf_bytes):
+def extract_header(doc, pages):
 
-    doc = fitz.open(
-        stream=pdf_bytes,
-        filetype="pdf"
-    )
-
-    first_page_text = (
-        doc[0].get_text("text", sort=True)
-        if len(doc) else ""
-    )
-
-    first_page_blocks = [
-        clean_text(block[4])
-        for block in doc[0].get_text("blocks")
-        if clean_text(block[4])
-    ] if len(doc) else []
-
-    all_text = "\n".join(page_texts[:8])
+    first_text = pages[0] if pages else ""
 
     be_no = ""
     be_date = ""
 
-    # BOE number and date
-    header_patterns = [
-        r"\b(?:BE\s*No\.?|BOE\s*No\.?|Bill\s+of\s+Entry\s+No\.?)"
+    # BOE number
+    patterns = [
+        r"(?:BE\s*No\.?|BOE\s*No\.?|Bill\s+of\s+Entry\s+No\.?)"
         r"\s*[:\-]?\s*(\d{5,})",
 
-        r"\b(\d{5,})\s+(\d{1,2}[/\-]\d{1,2}[/\-]\d{4})\b"
+        r"\b(\d{5,})\s+(\d{1,2}[-/]\d{1,2}[-/]\d{4})"
     ]
 
-    for pattern in header_patterns:
+    for pattern in patterns:
 
-        match = re.search(
+        m = re.search(
             pattern,
-            first_page_text,
+            first_text,
             re.IGNORECASE
         )
 
-        if match:
+        if m:
 
-            if len(match.groups()) == 2:
-                be_no = match.group(1)
-                be_date = match.group(2)
+            be_no = m.group(1)
 
-            else:
-                be_no = match.group(1)
+            if len(m.groups()) > 1:
+                be_date = m.group(2)
 
-            if be_no:
-                break
+            break
 
     if not be_date:
 
-        date_match = re.search(
-            r"\b(?:BE\s*Date|BOE\s*Date|Date)"
-            r"\s*[:\-]?\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{4})",
-            first_page_text,
+        m = re.search(
+            r"(?:BE\s*Date|BOE\s*Date|Date)"
+            r"\s*[:\-]?\s*(\d{1,2}[-/]\d{1,2}[-/]\d{4})",
+            first_text,
             re.IGNORECASE
         )
 
-        if date_match:
-            be_date = date_match.group(1)
+        if m:
+            be_date = m.group(1)
 
-    # Exporter and address
+    # Exporter / address
+    all_text = "\n".join(pages[:8])
+
     exporter = ""
     address = ""
 
-    exporter_match = re.search(
+    m = re.search(
         r"BIOLEGEND\s+INC\.?",
         all_text,
         re.IGNORECASE
     )
 
-    if exporter_match:
+    if m:
 
         exporter = "BIOLEGEND INC."
 
-        address_match = re.search(
+        am = re.search(
             r"8999\s+BIOLEGEND\s+WAY"
             r"[\s,]+SAN\s+DIEGO"
             r"[\s,]+CA"
@@ -200,8 +208,9 @@ def extract_header(page_texts, pdf_bytes):
             re.IGNORECASE
         )
 
-        if address_match:
-            address = clean_text(address_match.group(0))
+        if am:
+
+            address = clean(am.group(0))
 
             if not re.search(
                 r"UNITED STATES|USA|US$",
@@ -210,40 +219,30 @@ def extract_header(page_texts, pdf_bytes):
             ):
                 address += " UNITED STATES"
 
-    # Generic exporter fallback
     if not exporter:
 
-        exporter_match = re.search(
+        m = re.search(
             r"EXPORTER\s*[:\-]?\s*(.+)",
             all_text,
             re.IGNORECASE
         )
 
-        if exporter_match:
-            exporter = clean_text(
-                exporter_match.group(1).splitlines()[0]
-            )
+        if m:
+            exporter = clean(m.group(1).splitlines()[0])
 
-    # Convert date
     if be_date:
 
-        for fmt in (
-            "%d/%m/%Y",
-            "%d-%m-%Y",
-            "%m/%d/%Y"
-        ):
+        for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y"):
 
             try:
                 be_date = datetime.strptime(
-                    be_date, fmt
+                    be_date,
+                    fmt
                 ).strftime("%d-%m-%Y")
-
                 break
 
             except ValueError:
                 pass
-
-    doc.close()
 
     return {
         "BOE No.": be_no,
@@ -253,142 +252,286 @@ def extract_header(page_texts, pdf_bytes):
     }
 
 
-# ============================================================
-# ITEM DESCRIPTION EXTRACTION
-# ============================================================
+# ==========================================================
+# FIRST PAGE GST SUMMARY
+# THIS IS THE MASTER SOURCE
+# ==========================================================
 
-def extract_description(first_line, block_lines):
+def extract_first_page_gst(doc):
 
-    description = first_line
+    if len(doc) == 0:
+        return pd.DataFrame(), None, []
 
-    # Remove initial item identifiers
-    description = re.sub(
-        r"^\s*\d+\s+\d+\s+\d{8}\s+NOEXCISE\b",
-        "",
-        description,
-        flags=re.IGNORECASE
-    )
+    page = doc[0]
 
-    # Remove trailing item flags
-    description = re.sub(
-        r"\s+N\s+N\s+Y\s+N\s+N\s*$",
-        "",
-        description,
-        flags=re.IGNORECASE
-    )
+    position_lines = get_position_lines(page)
 
-    description = clean_text(description)
+    text = page.get_text("text", sort=True) or ""
 
-    # Use continuation text only if first line is empty
-    if not description:
+    # Use position-based lines first
+    lines = [line for _, line in position_lines]
 
-        for line in block_lines[1:]:
+    if not lines:
+        lines = text.splitlines()
 
-            line = clean_text(line)
+    records = []
+    total_taxable = None
+    total_igst = None
+    issues = []
 
-            if not line:
-                continue
+    # Find GST table area
+    gst_start = None
 
-            if re.search(
-                r"\b(?:Rate|Amount|Assessable|Duty|Invoice)\b",
-                line,
-                re.IGNORECASE
-            ):
-                break
+    for i, line in enumerate(lines):
 
-            if re.fullmatch(
-                r"[\d,.\s]+",
-                line
-            ):
-                continue
-
-            if re.search(
-                r"^\d+\s+\d+\s+\d{8}\s+NOEXCISE",
-                line,
-                re.IGNORECASE
-            ):
-                continue
-
-            description = line
+        if (
+            re.search(r"\bHSN\b", line, re.IGNORECASE)
+            and re.search(r"GST", line, re.IGNORECASE)
+        ):
+            gst_start = i
             break
 
-    return description or "Description not captured"
+    if gst_start is None:
+
+        # Fallback if headings are split across PDF lines
+        for i, line in enumerate(lines):
+
+            if re.search(
+                r"\bHSN\b",
+                line,
+                re.IGNORECASE
+            ):
+                gst_start = i
+                break
+
+    if gst_start is None:
+
+        return pd.DataFrame(), None, [
+            "First page GST table heading not detected."
+        ]
+
+    # Process lines following GST heading
+    for line in lines[gst_start + 1:]:
+
+        line = clean(line)
+
+        if not line:
+            continue
+
+        # Skip heading fragments
+        if re.search(
+            r"DETAILS|TAXABLE|TAX AMOUNT|GST\s*@|HSN",
+            line,
+            re.IGNORECASE
+        ):
+            continue
+
+        # GST row:
+        # SI HSN RATE TAXABLE TAX
+        # Example:
+        # 1 30021500 5 2655868.00 132793.40
+        row_pattern = re.compile(
+            r"^\s*(?:\d+\s+)?"
+            r"(?P<hsn>\d{8})\s+"
+            r"(?P<rate>\d{1,2}(?:\.\d+)?)\s*%?\s+"
+            r"(?P<taxable>[\d,]+\.\d{2})\s+"
+            r"(?P<tax>[\d,]+\.\d{2})\s*$"
+        )
+
+        m = row_pattern.search(line)
+
+        if m:
+
+            records.append({
+
+                "HSN": m.group("hsn"),
+
+                "GST Rate (%)": float(
+                    m.group("rate")
+                ),
+
+                "Taxable Amount": num(
+                    m.group("taxable")
+                ),
+
+                "IGST Amount": num(
+                    m.group("tax")
+                ),
+
+                "Source": "First Page PDF"
+
+            })
+
+            continue
+
+        # Alternate: line may have SI separated from HSN
+        # or a GST rate with decimal
+        alt = re.search(
+            r"(?<!\d)(\d{8})\s+"
+            r"(\d{1,2}(?:\.\d+)?)\s*%?\s+"
+            r"([\d,]+\.\d{2})\s+"
+            r"([\d,]+\.\d{2})(?!\d)",
+            line
+        )
+
+        if alt:
+
+            records.append({
+
+                "HSN": alt.group(1),
+
+                "GST Rate (%)": float(alt.group(2)),
+
+                "Taxable Amount": num(alt.group(3)),
+
+                "IGST Amount": num(alt.group(4)),
+
+                "Source": "First Page PDF"
+
+            })
+
+            continue
+
+        # Total row: no HSN, two monetary values
+        # Stop after finding total
+        if re.search(
+            r"\bTOTAL\b|\bGRAND\s+TOTAL\b",
+            line,
+            re.IGNORECASE
+        ):
+
+            vals = numbers(line)
+
+            if len(vals) >= 2:
+
+                total_taxable = num(vals[-2])
+                total_igst = num(vals[-1])
+
+                break
+
+    # Fallback total detection:
+    # Find amount pair below GST rows, without HSN
+    if records and (
+        total_taxable is None or total_igst is None
+    ):
+
+        first_hsn_index = None
+
+        for i, line in enumerate(lines):
+
+            if re.search(r"\b\d{8}\b", line):
+                first_hsn_index = i
+                break
+
+        if first_hsn_index is not None:
+
+            for line in lines[first_hsn_index + 1:]:
+
+                line = clean(line)
+
+                if re.search(
+                    r"\b\d{8}\b",
+                    line
+                ):
+                    continue
+
+                vals = numbers(line)
+
+                if len(vals) == 2:
+
+                    a = num(vals[0])
+                    b = num(vals[1])
+
+                    if (
+                        a is not None
+                        and b is not None
+                        and a > 100
+                        and b > 0
+                    ):
+
+                        total_taxable = a
+                        total_igst = b
+
+    # Duplicate HSN rows must not silently disappear
+    if records:
+
+        df = pd.DataFrame(records)
+
+        duplicates = df.duplicated(
+            subset=[
+                "HSN",
+                "GST Rate (%)",
+                "Taxable Amount",
+                "IGST Amount"
+            ]
+        )
+
+        if duplicates.any():
+
+            df = df.drop_duplicates(
+                subset=[
+                    "HSN",
+                    "GST Rate (%)",
+                    "Taxable Amount",
+                    "IGST Amount"
+                ]
+            )
+
+        return df.reset_index(drop=True), {
+            "PDF Total Taxable": total_taxable,
+            "PDF Total IGST": total_igst
+        }, issues
+
+    return pd.DataFrame(), {
+        "PDF Total Taxable": total_taxable,
+        "PDF Total IGST": total_igst
+    }, [
+        "No HSN-wise GST rows could be read from the first page. "
+        "Check the PDF text layout."
+    ]
 
 
-# ============================================================
-# ASSESSABLE VALUE EXTRACTION
-# ============================================================
+# ==========================================================
+# ITEM EXTRACTION
+# ==========================================================
 
-def extract_assessable_values(block):
+def extract_assessable(block):
 
-    # Primary pattern
     pattern = re.compile(
         r"\bY\s+N\s+Y\s+N\s+Y\s+Y\s+"
-        rf"({NUMBER_PATTERN})\s+"
-        rf"({NUMBER_PATTERN})",
+        rf"({NUMBER})\s+"
+        rf"({NUMBER})",
         re.IGNORECASE | re.DOTALL
     )
 
-    match = pattern.search(block)
+    m = pattern.search(block)
 
-    if match:
-
-        return (
-            to_number(match.group(1)),
-            to_number(match.group(2))
-        )
-
-    # Flexible whitespace fallback
-    compact = re.sub(
-        r"\s+",
-        " ",
-        block
-    )
-
-    match = pattern.search(compact)
-
-    if match:
-
-        return (
-            to_number(match.group(1)),
-            to_number(match.group(2))
-        )
+    if m:
+        return num(m.group(1)), num(m.group(2))
 
     return None, None
 
 
-# ============================================================
-# RATE AND AMOUNT EXTRACTION
-# ============================================================
-
-def extract_labeled_numbers(block, label, min_count=1):
+def extract_labeled(block, label, minimum):
 
     lines = block.splitlines()
 
     for i, line in enumerate(lines):
 
-        match = re.search(
+        m = re.search(
             rf"\b{re.escape(label)}\b",
             line,
             re.IGNORECASE
         )
 
-        if not match:
+        if not m:
             continue
 
-        content = line[match.end():]
+        values = numbers(line[m.end():])
 
-        values = get_numbers(content)
-
-        # Check following line if current line is incomplete
-        if len(values) < min_count:
+        if len(values) < minimum:
 
             for next_line in lines[i + 1:i + 4]:
-
-                next_line = clean_text(next_line)
-
-                if not next_line:
-                    continue
 
                 if re.search(
                     r"\b(?:Rate|Amount|Assessable|Description)\b",
@@ -397,58 +540,50 @@ def extract_labeled_numbers(block, label, min_count=1):
                 ):
                     break
 
-                values.extend(get_numbers(next_line))
+                values.extend(numbers(next_line))
 
-                if len(values) >= min_count:
+                if len(values) >= minimum:
                     break
 
-        if len(values) >= min_count:
-
-            return [
-                to_number(x)
-                for x in values
-            ]
+        if len(values) >= minimum:
+            return [num(x) for x in values]
 
     return []
 
 
-# ============================================================
-# ITEM PARSING ENGINE
-# ============================================================
+def parse_items(pages):
 
-def parse_item_blocks(page_texts):
+    full_text = "\n".join(pages)
 
-    full_text = "\n".join(page_texts)
     lines = full_text.splitlines()
 
     starts = []
 
     for i, line in enumerate(lines):
 
-        match = ITEM_START.match(line)
+        m = ITEM_START.match(line)
 
-        if match:
-            starts.append((i, match))
+        if m:
+            starts.append((i, m))
 
     rows = []
-    parse_issues = []
+    issues = []
 
     if not starts:
 
         return pd.DataFrame(), [
-            "No Item Start Pattern Found. "
-            "PDF layout needs verification."
+            "Item start pattern was not found."
         ]
 
-    for index, (start_line, match) in enumerate(starts):
+    for index, (start, match) in enumerate(starts):
 
-        end_line = (
+        end = (
             starts[index + 1][0]
             if index + 1 < len(starts)
             else len(lines)
         )
 
-        block_lines = lines[start_line:end_line]
+        block_lines = lines[start:end]
 
         block = "\n".join(block_lines)
 
@@ -456,85 +591,58 @@ def parse_item_blocks(page_texts):
         item_si = int(match.group(2))
         hsn = match.group(3)
 
-        description = extract_description(
-            match.group(4),
-            block_lines
-        )
+        description = clean(match.group(4))
 
-        # Assessable Value and Total Duty
-        assessable, total_duty = extract_assessable_values(
+        if not description:
+            description = "Description not captured"
+
+        assessable, total_duty = extract_assessable(
             block
         )
 
-        # Rate section
-        rate_values = extract_labeled_numbers(
+        rates = extract_labeled(
             block,
             "Rate",
-            min_count=5
+            5
         )
 
-        # Amount section
-        amount_values = extract_labeled_numbers(
+        amounts = extract_labeled(
             block,
             "Amount",
-            min_count=3
+            3
         )
 
-        # Default values
-        bcd = None
-        sws = None
-        igst = None
-        igst_rate = None
+        igst_rate = rates[2] if len(rates) >= 5 else None
 
-        if len(rate_values) >= 5:
-            igst_rate = rate_values[2]
+        bcd = amounts[0] if len(amounts) >= 3 else None
+        sws = amounts[1] if len(amounts) >= 3 else None
+        igst = amounts[2] if len(amounts) >= 3 else None
 
-        if len(amount_values) >= 3:
+        taxable = None
 
-            bcd = amount_values[0]
-            sws = amount_values[1]
-            igst = amount_values[2]
+        if all(x is not None for x in [assessable, bcd, sws]):
 
-        # GST taxable base
-        gst_taxable = None
-
-        if (
-            assessable is not None
-            and bcd is not None
-            and sws is not None
-        ):
-
-            gst_taxable = round(
+            taxable = round(
                 assessable + bcd + sws,
                 2
             )
 
-        # Validation
         missing = []
 
-        if not description or description == "Description not captured":
-            missing.append("Description")
+        fields = {
+            "Assessable Value": assessable,
+            "Total Duty": total_duty,
+            "GST Rate": igst_rate,
+            "BCD": bcd,
+            "SWS": sws,
+            "IGST": igst,
+            "GST Taxable Amount": taxable
+        }
 
-        if assessable is None:
-            missing.append("Assessable Value")
+        for field, value in fields.items():
 
-        if total_duty is None:
-            missing.append("Total Duty")
-
-        if igst_rate is None:
-            missing.append("GST Rate")
-
-        if bcd is None:
-            missing.append("BCD")
-
-        if sws is None:
-            missing.append("SWS")
-
-        if igst is None:
-            missing.append("IGST")
-
-        if gst_taxable is None:
-            missing.append("GST Taxable Amount")
+            if value is None:
+                missing.append(field)
 
         status = (
             "OK"
@@ -544,9 +652,9 @@ def parse_item_blocks(page_texts):
 
         if missing:
 
-            parse_issues.append(
-                f"Item SI {item_si} | HSN {hsn} | "
-                f"Missing: {', '.join(missing)}"
+            issues.append(
+                f"Item SI {item_si}, HSN {hsn}: "
+                + ", ".join(missing)
             )
 
         rows.append({
@@ -559,7 +667,7 @@ def parse_item_blocks(page_texts):
             "Assessable Value": assessable,
             "BCD": bcd,
             "SWS": sws,
-            "GST Taxable Amount": gst_taxable,
+            "GST Taxable Amount": taxable,
             "IGST Amount": igst,
             "Total Duty": total_duty,
             "Extraction Status": status,
@@ -567,202 +675,113 @@ def parse_item_blocks(page_texts):
 
         })
 
-    return pd.DataFrame(rows), parse_issues
+    return pd.DataFrame(rows), issues
 
 
-# ============================================================
-# GST SUMMARY
-# ============================================================
-
-def create_summary(detail):
-
-    if detail.empty:
-        return pd.DataFrame()
-
-    valid = detail.dropna(
-        subset=[
-            "HSN",
-            "GST Rate (%)",
-            "GST Taxable Amount",
-            "IGST Amount"
-        ]
-    ).copy()
-
-    if valid.empty:
-        return pd.DataFrame()
-
-    summary = (
-        valid.groupby(
-            ["HSN", "GST Rate (%)"],
-            as_index=False
-        )
-        .agg(
-            Items=("Item SI", "count"),
-            Taxable_Amount=("GST Taxable Amount", "sum"),
-            Tax_Amount=("IGST Amount", "sum")
-        )
-        .sort_values(
-            ["HSN", "GST Rate (%)"]
-        )
-        .reset_index(drop=True)
-    )
-
-    summary["Taxable_Amount"] = summary[
-        "Taxable_Amount"
-    ].round(2)
-
-    summary["Tax_Amount"] = summary[
-        "Tax_Amount"
-    ].round(2)
-
-    return summary
-
-
-# ============================================================
+# ==========================================================
 # RECONCILIATION
-# ============================================================
+# ==========================================================
 
-def create_checks(detail, summary, issues):
+def reconcile(first_summary, pdf_totals, detail):
 
-    complete_items = detail[
-        detail["Extraction Status"] == "OK"
-    ]
+    results = []
 
-    taxable_total = (
-        safe_sum(summary["Taxable_Amount"])
-        if not summary.empty else 0
+    # First page summary totals
+    summary_taxable = (
+        safe_sum(first_summary["Taxable Amount"])
+        if not first_summary.empty else None
     )
 
-    tax_total = (
-        safe_sum(summary["Tax_Amount"])
-        if not summary.empty else 0
+    summary_igst = (
+        safe_sum(first_summary["IGST Amount"])
+        if not first_summary.empty else None
     )
 
-    expected_gst = 0
-
-    if not summary.empty:
-
-        for _, row in summary.iterrows():
-
-            expected_gst += (
-                row["Taxable_Amount"]
-                * row["GST Rate (%)"] / 100
-            )
-
-    expected_gst = round(expected_gst, 2)
-
-    difference = round(
-        tax_total - expected_gst,
-        2
+    pdf_taxable = (
+        pdf_totals.get("PDF Total Taxable")
+        if pdf_totals else None
     )
 
-    checks = [
+    pdf_igst = (
+        pdf_totals.get("PDF Total IGST")
+        if pdf_totals else None
+    )
 
-        ("Total detected item blocks", len(detail)),
+    item_taxable = (
+        safe_sum(detail["GST Taxable Amount"])
+        if not detail.empty else None
+    )
 
-        ("Successfully extracted items", len(complete_items)),
+    item_igst = (
+        safe_sum(detail["IGST Amount"])
+        if not detail.empty else None
+    )
 
-        ("Items requiring verification", len(issues)),
+    def add(label, a, b, description):
 
-        ("Total taxable amount", taxable_total),
-
-        ("Total IGST amount", tax_total),
-
-        ("GST calculated from rate", expected_gst),
-
-        ("GST calculation difference", difference),
-
-        (
-            "GST mathematical status",
-            "PASS" if abs(difference) <= 0.05 else "CHECK"
+        difference = (
+            round(a - b, 2)
+            if a is not None and b is not None
+            else None
         )
 
-    ]
+        status = (
+            "PASS"
+            if difference is not None and abs(difference) <= 0.05
+            else "CHECK"
+        )
 
-    return checks
+        results.append({
 
+            "Check": label,
+            "First / Master Value": a,
+            "Compared Value": b,
+            "Difference": difference,
+            "Status": status,
+            "Description": description
 
-# ============================================================
-# EXCEL GENERATION
-# ============================================================
+        })
 
-def make_excel(header, detail, issues):
-
-    summary = create_summary(detail)
-
-    checks = create_checks(
-        detail,
-        summary,
-        issues
+    add(
+        "First Page Taxable Total vs HSN Rows",
+        pdf_taxable,
+        summary_taxable,
+        "PDF total against HSN summary rows"
     )
 
-    wb = Workbook()
+    add(
+        "First Page IGST Total vs HSN Rows",
+        pdf_igst,
+        summary_igst,
+        "PDF IGST total against HSN summary rows"
+    )
 
-    # --------------------------------------------------------
-    # SHEET 1: GST SUMMARY
-    # --------------------------------------------------------
+    add(
+        "Item Taxable vs First Page",
+        summary_taxable,
+        item_taxable,
+        "Item level taxable total against first page"
+    )
 
-    ws = wb.active
-    ws.title = "GST Summary"
+    add(
+        "Item IGST vs First Page",
+        summary_igst,
+        item_igst,
+        "Item level IGST against first page"
+    )
 
-    widths = {
-        "A": 18,
-        "B": 10,
-        "C": 18,
-        "D": 15,
-        "E": 23,
-        "F": 20
-    }
+    return pd.DataFrame(results)
 
-    for col, width in widths.items():
-        ws.column_dimensions[col].width = width
 
-    header_rows = [
-        ("BOE No.", ":", header.get("BOE No.", "")),
-        ("Date", ":", header.get("Date", "")),
-        ("EXPORTER", ":", header.get("EXPORTER", "")),
-        ("ADDRESS", ":", header.get("ADDRESS", ""))
-    ]
+# ==========================================================
+# EXCEL STYLING
+# ==========================================================
 
-    for r, values in enumerate(header_rows, start=1):
+def style_sheet(ws):
 
-        for c, value in enumerate(values, start=1):
+    ws.sheet_view.showGridLines = False
 
-            cell = ws.cell(r, c, value)
-
-            cell.alignment = Alignment(
-                vertical="center",
-                wrap_text=True
-            )
-
-        ws.merge_cells(
-            start_row=r,
-            start_column=3,
-            end_row=r,
-            end_column=6
-        )
-
-        ws.row_dimensions[r].height = (
-            30 if r == 4 else 22
-        )
-
-    ws.row_dimensions[5].height = 12
-
-    table_headers = [
-        "DETAILS",
-        "SI",
-        "HSN",
-        "GST @ %",
-        "TAXABLE AMOUNT",
-        "TAX AMOUNT"
-    ]
-
-    for col, value in enumerate(
-        table_headers,
-        start=1
-    ):
-
-        cell = ws.cell(6, col, value)
+    for cell in ws[1]:
 
         cell.font = Font(
             bold=True,
@@ -780,64 +799,103 @@ def make_excel(header, detail, issues):
             wrap_text=True
         )
 
-    for idx, row in summary.iterrows():
+    ws.freeze_panes = "A2"
 
-        r = 7 + idx
+    ws.auto_filter.ref = ws.dimensions
 
-        ws.cell(r, 1, idx + 1)
-        ws.cell(r, 2, "")
-        ws.cell(r, 3, str(row["HSN"]))
+    for column in ws.columns:
 
-        ws.cell(
-            r,
-            4,
-            f'{row["GST Rate (%)"]:g}%'
+        max_length = max(
+            len(str(cell.value or ""))
+            for cell in column
         )
 
-        ws.cell(
-            r,
-            5,
-            float(row["Taxable_Amount"])
+        ws.column_dimensions[
+            get_column_letter(column[0].column)
+        ].width = min(max_length + 4, 45)
+
+
+# ==========================================================
+# EXCEL GENERATOR
+# ==========================================================
+
+def make_excel(header, gst, pdf_totals, detail, checks):
+
+    wb = Workbook()
+
+    # GST SUMMARY
+    ws = wb.active
+    ws.title = "GST Summary"
+
+    header_rows = [
+        ("BOE No.", ":", header.get("BOE No.", "")),
+        ("Date", ":", header.get("Date", "")),
+        ("EXPORTER", ":", header.get("EXPORTER", "")),
+        ("ADDRESS", ":", header.get("ADDRESS", ""))
+    ]
+
+    for r, values in enumerate(header_rows, 1):
+
+        for c, value in enumerate(values, 1):
+            ws.cell(r, c, value)
+
+        ws.merge_cells(
+            start_row=r,
+            start_column=3,
+            end_row=r,
+            end_column=6
         )
 
-        ws.cell(
-            r,
-            6,
-            float(row["Tax_Amount"])
+    ws.append([])
+    ws.append([
+        "DETAILS",
+        "SI",
+        "HSN",
+        "GST @ %",
+        "TAXABLE AMOUNT",
+        "TAX AMOUNT"
+    ])
+
+    for cell in ws[6]:
+
+        cell.font = Font(
+            bold=True,
+            color="FFFFFF"
         )
 
-        for col in range(1, 7):
+        cell.fill = PatternFill(
+            "solid",
+            fgColor="1F4E78"
+        )
 
-            ws.cell(r, col).alignment = Alignment(
-                vertical="center",
-                horizontal=(
-                    "right" if col in (5, 6)
-                    else "center"
-                )
-            )
+    for i, row in gst.iterrows():
 
-        ws.cell(r, 5).number_format = '#,##,##0.00'
-        ws.cell(r, 6).number_format = '#,##,##0.00'
+        ws.append([
+            i + 1,
+            "",
+            str(row["HSN"]),
+            f'{row["GST Rate (%)"]:g}%',
+            row["Taxable Amount"],
+            row["IGST Amount"]
+        ])
 
-    total_row = 7 + len(summary) + 1
+    total_row = ws.max_row + 1
 
     ws.cell(
         total_row,
         5,
-        safe_sum(summary["Taxable_Amount"])
-        if not summary.empty else 0
+        pdf_totals.get("PDF Total Taxable")
+        if pdf_totals else None
     )
 
     ws.cell(
         total_row,
         6,
-        safe_sum(summary["Tax_Amount"])
-        if not summary.empty else 0
+        pdf_totals.get("PDF Total IGST")
+        if pdf_totals else None
     )
 
-    for col in range(1, 7):
-
-        cell = ws.cell(total_row, col)
+    for cell in ws[total_row]:
 
         cell.font = Font(bold=True)
 
@@ -846,204 +904,71 @@ def make_excel(header, detail, issues):
             fgColor="D9EAF7"
         )
 
-        cell.alignment = Alignment(
-            horizontal=(
-                "right" if col in (5, 6)
-                else "center"
-            )
-        )
-
-        cell.border = Border(
-            top=Side(
-                style="thin",
-                color="1F1F1F"
-            )
-        )
-
-    ws.cell(
-        total_row,
-        5
-    ).number_format = '#,##,##0.00'
-
-    ws.cell(
-        total_row,
-        6
-    ).number_format = '#,##,##0.00'
-
-    note_row = total_row + 2
-
-    ws.merge_cells(
-        start_row=note_row,
-        start_column=1,
-        end_row=note_row,
-        end_column=6
-    )
-
-    ws.cell(
-        note_row,
-        1,
-        "GST Taxable Amount = Assessable Value + BCD + SWS. "
-        "IGST Amount is extracted from the item duty Amount section. "
-        "Verify the final summary against the original BOE."
-    )
-
-    ws.cell(note_row, 1).font = Font(
-        italic=True,
-        size=9,
-        color="666666"
-    )
-
-    ws.cell(note_row, 1).alignment = Alignment(
-        wrap_text=True
-    )
-
-    ws.row_dimensions[note_row].height = 32
-
-    thin = Side(
-        style="thin",
-        color="B7C9D6"
-    )
-
     for row in ws.iter_rows(
-        min_row=1,
+        min_row=7,
         max_row=total_row,
-        min_col=1,
+        min_col=5,
         max_col=6
     ):
 
         for cell in row:
-            cell.border = Border(bottom=thin)
+            cell.number_format = '#,##,##0.00'
+
+    for col, width in {
+        "A": 18,
+        "B": 10,
+        "C": 18,
+        "D": 15,
+        "E": 23,
+        "F": 20
+    }.items():
+
+        ws.column_dimensions[col].width = width
 
     ws.freeze_panes = "A7"
     ws.sheet_view.showGridLines = False
-    ws.page_setup.orientation = "landscape"
-    ws.page_setup.fitToWidth = 1
-    ws.sheet_properties.pageSetUpPr.fitToPage = True
 
-    ws.print_area = f"A1:F{note_row}"
-
-    # --------------------------------------------------------
-    # SHEET 2: ITEM DETAILS
-    # --------------------------------------------------------
-
+    # ITEM DETAILS
     wd = wb.create_sheet("Item Details")
 
-    for col, name in enumerate(
-        detail.columns,
-        start=1
-    ):
+    for row in [detail.columns.tolist()] + detail.values.tolist():
+        wd.append([
+            None if pd.isna(x) else x
+            for x in row
+        ])
 
-        cell = wd.cell(1, col, name)
+    style_sheet(wd)
 
-        cell.font = Font(
-            bold=True,
-            color="FFFFFF"
-        )
+    # CHECKS
+    wc = wb.create_sheet("Checks")
 
-        cell.fill = PatternFill(
-            "solid",
-            fgColor="1F4E78"
-        )
+    for row in [checks.columns.tolist()] + checks.values.tolist():
 
-        cell.alignment = Alignment(
-            wrap_text=True,
-            horizontal="center"
-        )
+        wc.append([
+            None if pd.isna(x) else x
+            for x in row
+        ])
 
-    for row_idx, row in enumerate(
-        detail.itertuples(index=False, name=None),
-        start=2
-    ):
+    style_sheet(wc)
 
-        for col_idx, value in enumerate(
-            row,
-            start=1
-        ):
+    # FIRST PAGE RAW VALUES
+    wr = wb.create_sheet("PDF Totals")
 
-            if pd.isna(value):
-                value = None
+    wr.append(["Field", "PDF Value"])
 
-            wd.cell(
-                row_idx,
-                col_idx,
-                value
-            )
+    wr.append([
+        "First Page Taxable Total",
+        pdf_totals.get("PDF Total Taxable")
+        if pdf_totals else None
+    ])
 
-            if isinstance(value, (int, float)):
+    wr.append([
+        "First Page IGST Total",
+        pdf_totals.get("PDF Total IGST")
+        if pdf_totals else None
+    ])
 
-                if col_idx >= 6 and col_idx <= 11:
-
-                    wd.cell(
-                        row_idx,
-                        col_idx
-                    ).number_format = '#,##,##0.00'
-
-    detail_widths = [
-        12, 10, 14, 58, 14, 18, 14,
-        14, 20, 18, 16, 20, 35
-    ]
-
-    for idx, width in enumerate(
-        detail_widths,
-        start=1
-    ):
-
-        wd.column_dimensions[
-            get_column_letter(idx)
-        ].width = width
-
-    wd.freeze_panes = "A2"
-
-    wd.auto_filter.ref = (
-        f"A1:{get_column_letter(len(detail.columns))}"
-        f"{len(detail) + 1}"
-    )
-
-    wd.sheet_view.showGridLines = False
-
-    # --------------------------------------------------------
-    # SHEET 3: CHECKS
-    # --------------------------------------------------------
-
-    wr = wb.create_sheet("Checks")
-
-    wr.append(["CHECK", "VALUE"])
-
-    for cell in wr[1]:
-
-        cell.font = Font(
-            bold=True,
-            color="FFFFFF"
-        )
-
-        cell.fill = PatternFill(
-            "solid",
-            fgColor="1F4E78"
-        )
-
-    for item in checks:
-        wr.append(list(item))
-
-    wr.column_dimensions["A"].width = 38
-    wr.column_dimensions["B"].width = 25
-
-    for row in range(2, wr.max_row + 1):
-
-        value = wr.cell(row, 2).value
-
-        if isinstance(value, (int, float)):
-
-            wr.cell(
-                row,
-                2
-            ).number_format = '#,##,##0.00'
-
-    wr.freeze_panes = "A2"
-    wr.sheet_view.showGridLines = False
-
-    # --------------------------------------------------------
-    # SAVE EXCEL
-    # --------------------------------------------------------
+    style_sheet(wr)
 
     output = io.BytesIO()
 
@@ -1051,286 +976,245 @@ def make_excel(header, detail, issues):
 
     output.seek(0)
 
-    return output.getvalue(), summary
+    return output.getvalue()
 
 
-# ============================================================
-# STREAMLIT UPLOAD SECTION
-# ============================================================
+# ==========================================================
+# STREAMLIT UI
+# ==========================================================
 
 uploaded_file = st.file_uploader(
-    "1. Upload Bill of Entry PDF",
-    type=["pdf"],
-    accept_multiple_files=False,
-    help="ICEGATE Bill of Entry PDF upload karein."
+    "Upload Bill of Entry PDF",
+    type=["pdf"]
 )
 
-if uploaded_file is not None:
+if uploaded_file:
 
     st.success(
         f"Uploaded: {uploaded_file.name}"
     )
 
     if st.button(
-        "🔍 Extract Data",
+        "🔍 EXTRACT DATA",
         type="primary",
         use_container_width=True
     ):
 
-        # Clear previous extraction
         for key in [
-            "boe_header",
-            "boe_detail",
-            "boe_issues",
-            "boe_filename"
+            "header",
+            "gst",
+            "pdf_totals",
+            "detail",
+            "checks",
+            "issues",
+            "excel"
         ]:
 
             st.session_state.pop(key, None)
 
         with st.spinner(
-            "PDF processing and extracting item details..."
+            "Reading first page GST summary and item details..."
         ):
 
             try:
 
                 pdf_bytes = uploaded_file.getvalue()
 
-                page_texts = extract_pdf_text(
-                    pdf_bytes
+                doc = fitz.open(
+                    stream=pdf_bytes,
+                    filetype="pdf"
                 )
+
+                pages = [
+                    page.get_text("text", sort=True) or ""
+                    for page in doc
+                ]
 
                 header = extract_header(
-                    page_texts,
-                    pdf_bytes
+                    doc,
+                    pages
                 )
 
-                detail, issues = parse_item_blocks(
-                    page_texts
+                gst, pdf_totals, gst_issues = (
+                    extract_first_page_gst(doc)
                 )
 
-                if detail.empty:
+                detail, item_issues = parse_items(
+                    pages
+                )
 
-                    st.error(
-                        "No item records extracted. "
-                        "PDF may be scanned or have a different layout."
-                    )
+                checks = reconcile(
+                    gst,
+                    pdf_totals,
+                    detail
+                )
 
-                    st.warning(
-                        "OCR or a PDF-specific extraction pattern "
-                        "may be required."
-                    )
+                issues = gst_issues + item_issues
 
-                else:
+                excel = make_excel(
+                    header,
+                    gst,
+                    pdf_totals,
+                    detail,
+                    checks
+                )
 
-                    st.session_state["boe_header"] = header
+                st.session_state["header"] = header
+                st.session_state["gst"] = gst
+                st.session_state["pdf_totals"] = pdf_totals
+                st.session_state["detail"] = detail
+                st.session_state["checks"] = checks
+                st.session_state["issues"] = issues
+                st.session_state["excel"] = excel
 
-                    st.session_state["boe_detail"] = detail
+                doc.close()
 
-                    st.session_state["boe_issues"] = issues
-
-                    st.session_state["boe_filename"] = uploaded_file.name
-
-                    st.success(
-                        f"{len(detail)} item blocks detected."
-                    )
-
-            except Exception as exc:
+            except Exception as e:
 
                 st.error(
-                    f"PDF processing error: {exc}"
+                    f"Processing Error: {e}"
                 )
 
 
-# ============================================================
-# RESULTS SECTION
-# ============================================================
+# ==========================================================
+# DISPLAY RESULTS
+# ==========================================================
 
-if "boe_detail" in st.session_state:
+if "gst" in st.session_state:
 
-    header = st.session_state["boe_header"]
-
-    detail = st.session_state["boe_detail"]
-
-    issues = st.session_state["boe_issues"]
+    header = st.session_state["header"]
+    gst = st.session_state["gst"]
+    pdf_totals = st.session_state["pdf_totals"]
+    detail = st.session_state["detail"]
+    checks = st.session_state["checks"]
+    issues = st.session_state["issues"]
 
     st.divider()
 
-    st.subheader("2. Extracted BOE Details")
+    st.subheader("1. BOE Details")
 
     c1, c2, c3 = st.columns(3)
 
     c1.metric(
         "BOE Number",
-        header.get("BOE No.") or "Not found"
+        header["BOE No."] or "Not Found"
     )
 
     c2.metric(
-        "BOE Date",
-        header.get("Date") or "Not found"
+        "Date",
+        header["Date"] or "Not Found"
     )
 
     c3.metric(
-        "Items detected",
+        "Items Detected",
         len(detail)
     )
 
-    st.write(
-        "**Exporter:**",
-        header.get("EXPORTER") or "Not found"
-    )
+    st.write("**Exporter:**", header["EXPORTER"])
+    st.write("**Address:**", header["ADDRESS"])
 
-    st.write(
-        "**Address:**",
-        header.get("ADDRESS") or "Not found"
-    )
+    st.divider()
 
-    # --------------------------------------------------------
-    # SUMMARY
-    # --------------------------------------------------------
+    # FIRST PAGE MASTER SUMMARY
+    st.subheader("2. First Page HSN-wise GST Summary")
 
-    summary = create_summary(detail)
-
-    st.subheader("3. HSN-wise GST Summary")
-
-    if not summary.empty:
-
-        display_summary = summary.copy()
-
-        display_summary.insert(
-            0,
-            "SI",
-            range(1, len(display_summary) + 1)
-        )
-
-        display_summary["GST Rate (%)"] = (
-            display_summary["GST Rate (%)"]
-            .map(lambda x: f"{x:g}%")
-        )
-
-        display_summary = display_summary.rename(
-            columns={
-                "Taxable_Amount": "TAXABLE AMOUNT",
-                "Tax_Amount": "TAX AMOUNT"
-            }
-        )
+    if not gst.empty:
 
         st.dataframe(
-            display_summary[
-                [
-                    "SI",
-                    "HSN",
-                    "GST Rate (%)",
-                    "Items",
-                    "TAXABLE AMOUNT",
-                    "TAX AMOUNT"
-                ]
-            ],
+            gst,
             use_container_width=True,
             hide_index=True
         )
 
-        taxable_total = safe_sum(
-            summary["Taxable_Amount"]
-        )
-
-        tax_total = safe_sum(
-            summary["Tax_Amount"]
-        )
-
-        col1, col2 = st.columns(2)
-
-        col1.metric(
-            "Total Taxable Amount",
-            f"₹{indian_number_format(taxable_total)}"
-        )
-
-        col2.metric(
-            "Total IGST Amount",
-            f"₹{indian_number_format(tax_total)}"
+        st.metric(
+            "First Page IGST Total",
+            (
+                f'₹{money(pdf_totals["PDF Total IGST"])}'
+                if pdf_totals and pdf_totals.get("PDF Total IGST") is not None
+                else "Not detected"
+            )
         )
 
     else:
 
         st.error(
-            "HSN summary could not be generated."
+            "First Page GST Summary could not be extracted."
         )
 
-    # --------------------------------------------------------
     # ITEM DETAILS
-    # --------------------------------------------------------
+    st.subheader("3. Item-wise Details")
 
-    st.subheader("4. Item-wise Extracted Details")
+    if not detail.empty:
+
+        st.dataframe(
+            detail,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    else:
+
+        st.warning(
+            "No item blocks were detected."
+        )
+
+    # RECONCILIATION
+    st.subheader("4. Reconciliation Checks")
 
     st.dataframe(
-        detail,
+        checks,
         use_container_width=True,
         hide_index=True
     )
 
-    # --------------------------------------------------------
-    # ERROR REPORT
-    # --------------------------------------------------------
+    if not gst.empty and pdf_totals:
 
+        master = pdf_totals.get("PDF Total IGST")
+
+        if master is not None:
+
+            extracted = safe_sum(
+                gst["IGST Amount"]
+            )
+
+            difference = round(
+                master - extracted,
+                2
+            )
+
+            if abs(difference) <= 0.05:
+
+                st.success(
+                    f"First Page IGST matched. Difference: ₹{money(difference)}"
+                )
+
+            else:
+
+                st.error(
+                    f"First Page IGST mismatch. Difference: ₹{money(difference)}"
+                )
+
+        else:
+
+            st.warning(
+                "PDF total IGST could not be independently detected."
+            )
+
+    # ISSUES
     if issues:
 
-        st.error(
-            f"{len(issues)} item records require verification."
-        )
-
         with st.expander(
-            "⚠️ View Missing / Incorrect Item Details",
+            f"⚠️ Extraction Issues ({len(issues)})",
             expanded=True
         ):
 
             for issue in issues:
                 st.write("•", issue)
 
-    else:
+    # DOWNLOAD
+    st.divider()
 
-        st.success(
-            "All detected item records passed the extraction checks."
-        )
-
-    # --------------------------------------------------------
-    # EXTRACTION COUNT CHECK
-    # --------------------------------------------------------
-
-    st.subheader("5. Extraction Validation")
-
-    complete_count = len(
-        detail[
-            detail["Extraction Status"] == "OK"
-        ]
-    )
-
-    incomplete_count = len(detail) - complete_count
-
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric(
-        "Total Item Blocks",
-        len(detail)
-    )
-
-    col2.metric(
-        "Complete Items",
-        complete_count
-    )
-
-    col3.metric(
-        "Items Requiring Check",
-        incomplete_count
-    )
-
-    # --------------------------------------------------------
-    # DOWNLOAD EXCEL
-    # --------------------------------------------------------
-
-    excel_bytes, _ = make_excel(
-        header,
-        detail,
-        issues
-    )
+    st.subheader("5. Download Excel")
 
     base_name = re.sub(
         r"[^A-Za-z0-9_-]+",
@@ -1338,18 +1222,10 @@ if "boe_detail" in st.session_state:
         uploaded_file.name.rsplit(".", 1)[0]
     )
 
-    download_name = (
-        f"{base_name}_GST_Summary.xlsx"
-    )
-
-    st.divider()
-
-    st.subheader("6. Download Excel")
-
     st.download_button(
-        label="⬇️ Download Complete Excel Report",
-        data=excel_bytes,
-        file_name=download_name,
+        "⬇️ Download Complete Excel Report",
+        data=st.session_state["excel"],
+        file_name=f"{base_name}_BOE_Report.xlsx",
         mime=(
             "application/vnd.openxmlformats-officedocument."
             "spreadsheetml.sheet"
@@ -1357,21 +1233,8 @@ if "boe_detail" in st.session_state:
         use_container_width=True
     )
 
-    st.caption(
-        "Excel contains GST Summary, Item Details and Checks sheets."
-    )
-
 else:
 
-    st.markdown(
-        """
-        ### Workflow
-
-        1. Upload Bill of Entry PDF.
-        2. Click Extract Data.
-        3. Check BOE Details.
-        4. Verify HSN-wise GST Summary.
-        5. Check incomplete item records.
-        6. Download Excel Report.
-        """
+    st.info(
+        "Upload your Bill of Entry PDF and click EXTRACT DATA."
     )
