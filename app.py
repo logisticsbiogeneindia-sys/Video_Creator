@@ -114,34 +114,43 @@ def extract_first_page_gst(pdf_bytes):
 
 
 def extract_igst_from_component(block):
-    """Extract rate and amount only from the item's 5. IGST duty component."""
+    """Read Rate and Amount only inside the explicitly numbered 5. IGST section.
+
+    No generic GST-rate fallback is permitted. If the section/field is not
+    unambiguously present in the PDF text, return None so it remains blank.
+    """
     lines = clean_lines(block)
     start = None
+    heading_remainder = ""
     for i, line in enumerate(lines):
-        if re.search(r"(?:^|\s)5\s*[.)]?\s*IGST\b|^IGST\b", line, re.I):
+        heading = re.match(r"^5\s*[.)]\s*IGST\b(.*)$", line, re.I)
+        if heading:
             start = i
+            heading_remainder = heading.group(1).strip()
             break
     if start is None:
         return None, None
 
-    section = []
-    for line in lines[start:start + 30]:
-        # A new numbered duty component ends the IGST component.
-        if section and re.match(r"^\s*[6-9]\s*[.)]\s*", line):
+    section = [heading_remainder] if heading_remainder else []
+    for line in lines[start + 1:]:
+        # The next numbered duty component terminates section 5.
+        if re.match(r"^\s*[1-9]\s*[.)]\s*\S", line):
             break
         section.append(line)
     text = " ".join(section)
 
-    def value_after(label):
-        # Label and value may be on the same line or the next line.
-        m = re.search(r"\b" + label + r"\b\s*[:=]?\s*([\d,]+(?:\.\d+)?)", text, re.I)
-        if m:
-            return float(m.group(1).replace(",", ""))
-        return None
+    def exact_field(label):
+        # Require a field label followed by its numeric value. Do not search
+        # outside the section and do not accept a percentage from another row.
+        matches = re.findall(
+            rf"(?<![A-Za-z]){label}\s*[:=]?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+            text, re.I
+        )
+        if len(matches) != 1:
+            return None
+        return float(matches[0].replace(",", ""))
 
-    rate = value_after("Rate")
-    amount = value_after("Amount")
-    return rate, amount
+    return exact_field("Rate"), exact_field("Amount")
 
 
 def first_match(pattern, text, default=""):
@@ -271,7 +280,9 @@ def parse_item_blocks(page_texts):
                 # values blank so the reconciliation exposes the issue.
                 pass
 
-        gst_taxable = (assessable + bcd + sws) if None not in (assessable, bcd, sws) else None
+        # Taxable amount is NOT calculated. It is taken from the PDF's first-page
+        # GST summary only; item-level value remains blank unless explicitly parsed.
+        gst_taxable = None
 
         missing = []
         for label, value in [
@@ -312,16 +323,16 @@ def make_excel(header, detail, first_page_gst=None, first_page_total_taxable=Non
     if first_page_gst is None:
         first_page_gst = pd.DataFrame()
 
-    summary = (
-        detail.groupby(["HSN", "GST Rate (%)"], as_index=False)
-        .agg(
-            Items=("Item SI", "count"),
-            Taxable_Amount=("GST Taxable Amount", "sum"),
-            Tax_Amount=("IGST Amount", "sum")
-        )
-        .sort_values(["HSN", "GST Rate (%)"])
-        .reset_index(drop=True)
-    )
+    # The GST summary must reproduce page 1, not a reconstructed/calculated table.
+    summary = first_page_gst.copy() if first_page_gst is not None else pd.DataFrame()
+    if not summary.empty:
+        summary = summary.rename(columns={
+            "Taxable Amount": "Taxable_Amount",
+            "IGST Amount": "Tax_Amount"
+        })
+        summary["Items"] = ""
+    else:
+        summary = pd.DataFrame(columns=["SI", "HSN", "GST Rate (%)", "Taxable_Amount", "Tax_Amount", "Items"])
 
     wb = Workbook()
     ws = wb.active
@@ -369,8 +380,8 @@ def make_excel(header, detail, first_page_gst=None, first_page_total_taxable=Non
         ws.cell(r, 6).number_format = '#,##,##0.00'
 
     total_row = 7 + len(summary) + 1
-    ws.cell(total_row, 5, float(summary["Taxable_Amount"].sum()))
-    ws.cell(total_row, 6, float(summary["Tax_Amount"].sum()))
+    ws.cell(total_row, 5, first_page_total_taxable)
+    ws.cell(total_row, 6, first_page_total_igst)
     for col in range(1, 7):
         cell = ws.cell(total_row, col)
         cell.font = Font(bold=True)
@@ -384,8 +395,8 @@ def make_excel(header, detail, first_page_gst=None, first_page_total_taxable=Non
     ws.merge_cells(start_row=note_row, start_column=1, end_row=note_row, end_column=6)
     ws.cell(
         note_row, 1,
-        "Taxable Amount = Assessable Value + BCD + SWS. Tax Amount = IGST amount read from Part III of the BOE. "
-        "Please verify the totals against the original Bill of Entry."
+        "GST rates, taxable amounts and IGST totals in this sheet are transcribed from the PDF first-page GST summary. "
+        "Item-level IGST Rate and Amount are read only from the explicit 5. IGST section. Missing values are left blank."
     )
     ws.cell(note_row, 1).font = Font(italic=True, size=9, color="666666")
     ws.cell(note_row, 1).alignment = Alignment(wrap_text=True)
@@ -446,8 +457,8 @@ def make_excel(header, detail, first_page_gst=None, first_page_total_taxable=Non
     wr = wb.create_sheet("Checks")
     checks = [
         ("Total extracted items", len(detail)),
-        ("Total taxable amount", float(summary["Taxable_Amount"].sum())),
-        ("Total IGST amount", float(summary["Tax_Amount"].sum())),
+        ("PDF first-page taxable total", first_page_total_taxable),
+        ("PDF first-page IGST total", first_page_total_igst),
         ("Total assessable value", float(detail["Assessable Value"].sum())),
     ]
     wr.append(["Check", "Value"])
@@ -533,24 +544,11 @@ if "boe_detail" in st.session_state:
     t1.metric("First Page Taxable Total", f"₹{first_page_total_taxable:,.2f}" if first_page_total_taxable is not None else "Not detected")
     t2.metric("First Page IGST Total", f"₹{first_page_total_igst:,.2f}" if first_page_total_igst is not None else "Not detected")
 
-    summary = (
-        detail.groupby(["HSN", "GST Rate (%)"], as_index=False)
-        .agg(
-            Items=("Item SI", "count"),
-            **{"TAXABLE AMOUNT": ("GST Taxable Amount", "sum"),
-               "TAX AMOUNT": ("IGST Amount", "sum")}
-        )
-        .sort_values(["HSN", "GST Rate (%)"])
-    )
-    st.subheader("4. HSN-wise GST Summary (Item-wise calculation)")
-    display_summary = summary.copy()
-    display_summary.insert(0, "SI", range(1, len(display_summary) + 1))
-    display_summary["GST Rate (%)"] = display_summary["GST Rate (%)"].map(lambda x: f"{x:g}%")
-    st.dataframe(
-        display_summary[["SI", "HSN", "GST Rate (%)", "Items", "TAXABLE AMOUNT", "TAX AMOUNT"]],
-        use_container_width=True,
-        hide_index=True
-    )
+    st.subheader("4. HSN-wise GST Summary (PDF first page — direct extraction)")
+    if not first_page_gst.empty:
+        st.dataframe(first_page_gst, use_container_width=True, hide_index=True)
+    else:
+        st.error("PDF ke first page se GST summary reliably extract nahi hui. Koi GST rate/amount assume nahi kiya gaya.")
 
     st.subheader("5. Item-wise Extracted Details")
     st.dataframe(detail, use_container_width=True, hide_index=True)
@@ -574,7 +572,7 @@ if "boe_detail" in st.session_state:
         use_container_width=True
     )
     st.caption(
-        "Excel mein GST Summary, Item Details aur Checks naam ki 3 sheets hongi. "
+        "Excel mein PDF first-page GST Summary, Item Details aur Checks sheets hongi. Missing values blank rahengi. "
         "Save As popup ke liye Chrome mein Settings → Downloads → Ask where to save each file before downloading ON karein."
     )
 
