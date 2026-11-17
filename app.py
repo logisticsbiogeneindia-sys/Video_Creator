@@ -1,6 +1,5 @@
 import re
 import io
-import subprocess
 from datetime import datetime
 
 import fitz  # PyMuPDF
@@ -31,26 +30,15 @@ def clean_lines(text):
 
 
 def extract_pdf_text(pdf_bytes):
-    # Poppler's pdftotext -layout preserves ICEGATE table columns more reliably
-    # than generic PDF text extraction for duty rows.
+    """Extract text directly with PyMuPDF; works on Streamlit Cloud without Poppler."""
     try:
-        result = subprocess.run(
-            ["pdftotext", "-layout", "-", "-"],
-            input=pdf_bytes,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True
-        )
-    except FileNotFoundError:
-        raise RuntimeError(
-            "pdftotext (Poppler) install nahi mila. Windows par Poppler install karke "
-            "uske Library/bin folder ko PATH mein add karein, phir Streamlit dobara start karein."
-        )
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError("PDF text extraction fail hua: " + exc.stderr.decode("utf-8", errors="ignore"))
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page_texts = [page.get_text("text", sort=True) or "" for page in doc]
+        doc.close()
+        return page_texts
+    except Exception as exc:
+        raise RuntimeError(f"PDF read nahi ho paayi: {exc}")
 
-    full_text = result.stdout.decode("utf-8", errors="ignore")
-    return full_text.split("\\f")
 
 
 def first_match(pattern, text, default=""):
